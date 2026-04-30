@@ -2,34 +2,29 @@
 # One-line installer: curl -fsSL https://raw.githubusercontent.com/apoorva-01/notebook-cli/main/install.sh | bash
 set -euo pipefail
 
-DEST_DIR="${HOME}/.local/bin"
-DEST="${DEST_DIR}/notebook"
-SRC_URL="https://raw.githubusercontent.com/apoorva-01/notebook-cli/main/notebook"
-
-mkdir -p "${DEST_DIR}"
-echo "→ Downloading notebook to ${DEST}"
-curl -fsSL "${SRC_URL}" -o "${DEST}"
-chmod +x "${DEST}"
-
-if ! command -v notebooklm >/dev/null 2>&1; then
-  cat <<EOF
-
-⚠️  The underlying \`notebooklm\` CLI is not installed.
-
-Install it (one-time):
-    pipx install notebooklm-py
-    pipx inject notebooklm-py playwright
-    ~/.local/pipx/venvs/notebooklm-py/bin/playwright install chromium
-    notebooklm login
-
-Then run:
-    notebook --help
-EOF
-  exit 0
+if ! command -v pipx >/dev/null 2>&1; then
+  echo "→ pipx not found — installing via Homebrew (macOS) or pip --user."
+  if command -v brew >/dev/null 2>&1; then
+    brew install pipx
+  else
+    python3 -m pip install --user pipx
+    python3 -m pipx ensurepath || true
+  fi
 fi
 
-echo "✓ Installed. Try: notebook --help"
-case ":${PATH}:" in
-  *":${DEST_DIR}:"*) ;;
-  *) echo "ℹ️  Note: ${DEST_DIR} is not in your PATH. Add it to your shell profile."; ;;
-esac
+echo "→ Installing notebook-cli (this brings notebooklm-py + playwright)…"
+pipx install --force git+https://github.com/apoorva-01/notebook-cli
+
+cat <<'EOF'
+
+✓ Installed.
+
+One-time setup remaining:
+  playwright install chromium      # ~150 MB download
+  notebooklm login                  # opens browser; complete Google login
+
+Then try:
+  notebook --version
+  notebook --help
+
+EOF

@@ -580,5 +580,24 @@ def main(argv: list[str]) -> int:
     return subprocess.run(["notebooklm", cmd, *rest]).returncode
 
 
+def _entry() -> int:
+    """Console-script entry point. Adds --version and a first-run hint on top of main()."""
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("--version", "-V"):
+        from . import __version__
+        print(f"notebook-cli {__version__}")
+        return 0
+    # First-run hint: encourages playwright install + notebooklm login the first time.
+    if argv and argv[0] == "init":
+        sentinel = Path.home() / ".notebooklm" / "storage_state.json"
+        if not sentinel.exists():
+            print("ℹ️  First-time setup — the underlying CLI is not authenticated yet.", file=sys.stderr)
+            print("    Run once:", file=sys.stderr)
+            print("      playwright install chromium", file=sys.stderr)
+            print("      notebooklm login", file=sys.stderr)
+            print("", file=sys.stderr)
+    return main(argv)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(_entry())
