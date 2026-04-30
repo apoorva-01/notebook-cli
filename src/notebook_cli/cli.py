@@ -339,9 +339,35 @@ def _first_heading(p: Path) -> str:
         return ""
 
 
+DEFAULT_SESSION_DOCS_PROMPT = """\
+Using the Claude Code session plan/transcript content provided below as the
+primary source of truth, write a single comprehensive PLAN.md for this project.
+
+Structure it with these top-level sections (skip any that genuinely don't apply):
+
+  1. # <Project Name>
+  2. ## Overview & Goals — what we set out to build and why.
+  3. ## Plan — the plan-of-record we agreed on, milestones, phases.
+  4. ## Features — every feature/capability discussed or implemented, grouped
+     logically. Be specific (file names, command names, behaviors).
+  5. ## Architecture — components, data flow, key design choices, ascii/mermaid
+     sketch if helpful.
+  6. ## Deployment — how this is/will be deployed, infra, environment, secrets,
+     rollout/cutover steps.
+  7. ## Decisions & trade-offs — non-obvious decisions and why we made them.
+  8. ## Status — what's done, what's pending, known issues, open questions.
+
+Be concrete and detailed. Prefer faithfully reflecting what's in the session
+over inventing content. Output PLAN.md content ONLY — no preamble or fences.
+
+--- SESSION CONTENT ---
+"""
+
+
 def pick_and_import_session_plan(target: Path) -> Path | None:
-    """Interactively pick a plan from ~/.claude/plans/ and copy it into the
-    project root as PLAN.md. Returns the new local path, or None if cancelled."""
+    """Interactively pick a plan from ~/.claude/plans/, then run it through
+    Claude Code with a (user-editable) prompt to produce a proper PLAN.md.
+    Returns the new local path, or None if cancelled."""
     plans = list_session_plans()
     if not plans:
         print("No plans found in ~/.claude/plans/.", file=sys.stderr)
@@ -367,8 +393,57 @@ def pick_and_import_session_plan(target: Path) -> Path | None:
         ans = input(f"{dest} already exists. Overwrite? [y/N] ").strip().lower()
         if ans not in ("y", "yes"):
             return None
-    dest.write_text(src.read_text(errors="replace"))
-    print(f"✓ Copied {src.name} → {dest}")
+
+    # Ask how to transform the session into docs.
+    print()
+    print("How should this session be turned into PLAN.md?")
+    print("  1) Generate detailed docs with Claude Code (default — plan, features,")
+    print("     architecture, deploy, decisions, status). You can edit the prompt.")
+    print("  2) Copy the session file verbatim as PLAN.md (no Claude rewrite).")
+    mode = input("Choice [1/2, default 1]: ").strip() or "1"
+
+    if mode == "2":
+        dest.write_text(src.read_text(errors="replace"))
+        print(f"✓ Copied {src.name} → {dest}")
+        return dest
+
+    # Mode 1: run session through Claude Code with a customizable prompt.
+    if subprocess.run(["which", "claude"], capture_output=True).returncode != 0:
+        print("error: the `claude` CLI is not on your PATH — falling back to verbatim copy.", file=sys.stderr)
+        dest.write_text(src.read_text(errors="replace"))
+        print(f"✓ Copied {src.name} → {dest}")
+        return dest
+
+    print()
+    print("Enter a prompt for Claude (blank = use the default below).")
+    print("Default prompt:")
+    for ln in DEFAULT_SESSION_DOCS_PROMPT.rstrip().splitlines()[:10]:
+        print(f"  │ {ln}")
+    print("  │ …")
+    user_prompt = input("Your prompt (blank for default): ").strip()
+    instructions = user_prompt if user_prompt else DEFAULT_SESSION_DOCS_PROMPT.rstrip()
+
+    session_text = src.read_text(errors="replace")
+    full_prompt = f"{instructions}\n\n--- SESSION CONTENT ---\n\n{session_text}\n"
+
+    print(f"🧠 Running Claude Code over {src.name} ({len(session_text)} chars)…")
+    r = subprocess.run(
+        ["claude", "--print", full_prompt],
+        cwd=str(target),
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        sys.stderr.write(r.stderr)
+        print("error: claude failed — falling back to verbatim copy.", file=sys.stderr)
+        dest.write_text(session_text)
+        print(f"✓ Copied {src.name} → {dest}")
+        return dest
+
+    body = r.stdout.strip()
+    body = re.sub(r"^```(?:markdown|md)?\n?", "", body)
+    body = re.sub(r"\n?```\s*$", "", body)
+    dest.write_text(body + "\n")
+    print(f"✓ Wrote {dest} ({len(body)} chars, generated from {src.name})")
     return dest
 
 
