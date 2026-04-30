@@ -1,0 +1,5 @@
+.last_bundle.md
+.last_plan_bundle.md
+.DS_Store
+__pycache__/
+*.pyc

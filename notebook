@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""
+`notebook` — wrapper around the `notebooklm` CLI adding two commands:
+
+    notebook update [PATH]    Bundle the project at PATH (default: cwd) — plan,
+                              docs, README, key source files — into a single
+                              Markdown source and upload it to the notebook
+                              configured in this project's .notebook.json.
+                              Replaces the prior bundle source if one exists.
+
+    notebook plan-only [PATH] Like `update` but only the plan + top-level docs
+                              (README, AGENTS.md, CLAUDE.md, docs/**) — no code.
+                              Uploaded as a separate "Plan only" source.
+
+    notebook diff [PATH]      Show a unified diff between the current bundle
+                              and the last one uploaded. Useful before
+                              `notebook update` to preview what will change.
+
+    notebook claude install   Add a "Use NotebookLM for context" block to the
+                              project's CLAUDE.md so Claude Code knows to
+                              query this notebook before answering.
+
+    notebook init [NOTEBOOK_URL_OR_ID]
+                              Bind the current project to a notebook.
+                              With no argument: prompts whether to (1) create a
+                              new notebook, (2) pick an existing one from a
+                              list, or (3) paste a URL/ID.
+                              With an argument: skips the prompt and uses it.
+                              Saves the binding to .notebook.json.
+
+    notebook ask "QUESTION"   Pass-through to `notebooklm ask` against the
+                              notebook configured for this project.
+
+Anything else is forwarded to the underlying `notebooklm` CLI verbatim.
+"""
+from __future__ import annotations
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from datetime import datetime
+
+PROJECT_FILE = ".notebook.json"
+LAST_BUNDLE_SUFFIX = ".last_bundle.md"        # cached previous bundle (full)
+LAST_PLAN_BUNDLE_SUFFIX = ".last_plan_bundle.md"  # cached previous plan-only
+
+# Patterns we bundle from the repo, in order. First-match wins per file so we
+# don't double-include.
+INCLUDE_GLOBS = [
+    # Plans live globally
+    # (handled separately — see find_plan)
+    "README.md", "README.MD", "Readme.md",
+    "AGENTS.md", "CLAUDE.md",
+    "docs/**/*.md",
+    "DEPLOY.md", "ARCHITECTURE.md", "PARITY*.md", "PORTING*.md",
+    "CHANGELOG.md",
+    # Code skeleton (entry points only — keep the bundle small enough)
+    "package.json", "pyproject.toml", "Cargo.toml",
+    "lib/**/*.{js,ts,mjs}",
+    "src/**/*.{js,ts,mjs,py}",
+    "app/**/*.{ts,tsx}",
+    "components/**/*.{ts,tsx,mjs}",
+    "sources/**/*.mjs",
+]
+
+# Soft cap so we don't ship a 5MB blob. NotebookLM's tolerance is generous, but
+# more sources = noisier citations.
+MAX_BYTES_PER_FILE = 64 * 1024
+MAX_TOTAL_BYTES = 1_500_000  # ~1.5MB
+
+
+# --------------------------------------------------------------------------
+# Project config
+# --------------------------------------------------------------------------
+
+def load_project_config(start: Path) -> tuple[Path | None, dict]:
+    """Walk up from `start` to find .notebook.json. Returns (path, dict)."""
+    cur = start.resolve()
+    for _ in range(20):
+        candidate = cur / PROJECT_FILE
+        if candidate.exists():
+            try:
+                return candidate, json.loads(candidate.read_text())
+            except Exception:
+                return candidate, {}
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None, {}
+
+
+def save_project_config(path: Path, cfg: dict) -> None:
+    path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def parse_notebook_id(s: str) -> str:
+    m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", s)
+    return m.group(1) if m else s.strip()
+
+
+# --------------------------------------------------------------------------
+# Sub-commands
+# --------------------------------------------------------------------------
+
+def _list_existing_notebooks() -> list[dict]:
+    """Return [{id, title}] for the current account by parsing `notebooklm list --json`."""
+    r = subprocess.run(
+        ["notebooklm", "list", "--json"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return []
+    try:
+        data = json.loads(r.stdout)
+    except Exception:
+        return []
+    out = []
+    items = data if isinstance(data, list) else data.get("notebooks", [])
+    for nb in items:
+        nb_id = nb.get("id") or nb.get("notebook_id") or nb.get("uuid")
+        title = nb.get("title") or nb.get("name") or "(untitled)"
+        if nb_id:
+            out.append({"id": nb_id, "title": title})
+    return out
+
+
+def _interactive_pick_notebook() -> str | None:
+    """Prompt the user. Return notebook id, or None if cancelled."""
+    if not sys.stdin.isatty():
+        print("error: interactive init requires a terminal. Pass an ID or URL:", file=sys.stderr)
+        print("  notebook init <NOTEBOOK_URL_OR_ID>", file=sys.stderr)
+        return None
+
+    print("How do you want to bind this project?")
+    print("  1) Create a new notebook")
+    print("  2) Pick an existing notebook")
+    print("  3) Paste a URL or ID")
+    while True:
+        choice = input("Choice [1/2/3]: ").strip()
+        if choice in ("1", "2", "3"):
+            break
+        print("(enter 1, 2, or 3)")
+
+    if choice == "1":
+        title = input("Notebook title: ").strip()
+        if not title:
+            print("error: title is required.", file=sys.stderr)
+            return None
+        r = subprocess.run(
+            ["notebooklm", "create", title],
+            capture_output=True, text=True,
+        )
+        sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
+        if r.returncode != 0:
+            return None
+        m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", r.stdout)
+        if not m:
+            print("error: could not parse new notebook id from output.", file=sys.stderr)
+            return None
+        print(f"✓ Created notebook {m.group(1)}")
+        return m.group(1)
+
+    if choice == "2":
+        nbs = _list_existing_notebooks()
+        if not nbs:
+            print("No notebooks found (or list failed). Falling back to manual entry.")
+            choice = "3"
+        else:
+            for i, nb in enumerate(nbs, 1):
+                short = nb["id"].split("-")[0]
+                print(f"  {i:>2}. [{short}] {nb['title']}")
+            sel = input(f"Pick [1-{len(nbs)}]: ").strip()
+            try:
+                idx = int(sel)
+                if 1 <= idx <= len(nbs):
+                    return nbs[idx - 1]["id"]
+            except ValueError:
+                pass
+            print("error: invalid selection.", file=sys.stderr)
+            return None
+
+    # choice == "3"
+    raw = input("Notebook URL or ID: ").strip()
+    if not raw:
+        return None
+    return parse_notebook_id(raw)
+
+
+def cmd_init(args: list[str]) -> int:
+    cwd = Path.cwd()
+    cfg_path = cwd / PROJECT_FILE
+    existing = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+
+    # Confirm overwrite if already bound.
+    if existing.get("notebook_id") and not args:
+        if sys.stdin.isatty():
+            ans = input(f"This project is already bound to {existing['notebook_id']}. Re-bind? [y/N] ").strip().lower()
+            if ans not in ("y", "yes"):
+                print("Aborted.")
+                return 1
+        else:
+            print(f"already bound to {existing['notebook_id']} (pass an ID to force re-bind)", file=sys.stderr)
+            return 1
+
+    if args:
+        nb_id = parse_notebook_id(args[0])
+    else:
+        nb_id = _interactive_pick_notebook()
+        if not nb_id:
+            return 2
+
+    existing["notebook_id"] = nb_id
+    existing["initialized_at"] = datetime.now().isoformat(timespec="seconds")
+    save_project_config(cfg_path, existing)
+    print(f"✓ Notebook {nb_id} bound to {cwd} (saved to {PROJECT_FILE})")
+    return 0
+
+
+def _resolve_target_and_cfg(args: list[str]):
+    target = Path(args[0]).resolve() if args else Path.cwd().resolve()
+    if not target.is_dir():
+        print(f"error: {target} is not a directory", file=sys.stderr)
+        return None, None, None
+    cfg_path, cfg = load_project_config(target)
+    if not cfg.get("notebook_id"):
+        print("error: no notebook bound to this project. Run:", file=sys.stderr)
+        print("  notebook init <NOTEBOOK_URL_OR_ID>", file=sys.stderr)
+        return None, None, None
+    if cfg_path is None:
+        cfg_path = target / PROJECT_FILE
+    return target, cfg_path, cfg
+
+
+def _do_upload(kind: str, target: Path, cfg_path: Path, cfg: dict,
+               build_fn, default_title: str, cache_suffix: str) -> int:
+    nb = cfg["notebook_id"]
+    title_key = f"{kind}_title"
+    bundle_title = cfg.get(title_key, default_title)
+
+    print(f"📦 Bundling {target} ({kind}) for notebook {nb}…")
+    bundle = build_fn(target, bundle_title)
+    out_path = Path(f"/tmp/notebook_{kind}_{target.name}.md")
+    out_path.write_text(bundle)
+    size_kb = len(bundle.encode()) / 1024
+    print(f"   {size_kb:.1f} KB · {bundle.count(chr(10))} lines · saved to {out_path}")
+
+    print(f"🗑  Removing prior {kind} source (if any)…")
+    subprocess.run(
+        ["notebooklm", "source", "delete-by-title", "--notebook", nb, bundle_title],
+        check=False, capture_output=True,
+    )
+
+    print("⬆️  Uploading…")
+    r = subprocess.run(
+        ["notebooklm", "source", "add", str(out_path),
+         "--notebook", nb, "--title", bundle_title],
+        capture_output=True, text=True,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode != 0:
+        return r.returncode
+
+    # Cache bundle for future `notebook diff`
+    cache_path = target / cache_suffix
+    cache_path.write_text(bundle)
+
+    cfg[f"last_{kind}_at"] = datetime.now().isoformat(timespec="seconds")
+    cfg[f"last_{kind}_bytes"] = len(bundle.encode())
+    save_project_config(cfg_path, cfg)
+    print(f"✓ Updated notebook {nb}")
+    return 0
+
+
+def cmd_update(args: list[str]) -> int:
+    target, cfg_path, cfg = _resolve_target_and_cfg(args)
+    if target is None:
+        return 2
+    return _do_upload(
+        "update", target, cfg_path, cfg,
+        build_fn=build_bundle,
+        default_title=f"{target.name} — Project Bundle",
+        cache_suffix=LAST_BUNDLE_SUFFIX,
+    )
+
+
+def cmd_plan_only(args: list[str]) -> int:
+    target, cfg_path, cfg = _resolve_target_and_cfg(args)
+    if target is None:
+        return 2
+    return _do_upload(
+        "plan", target, cfg_path, cfg,
+        build_fn=build_plan_bundle,
+        default_title=f"{target.name} — Plan & Docs",
+        cache_suffix=LAST_PLAN_BUNDLE_SUFFIX,
+    )
+
+
+def cmd_diff(args: list[str]) -> int:
+    """Show a unified diff between current and last-uploaded bundle."""
+    import difflib
+    # Optional --plan flag to diff plan-only bundle instead of full
+    plan_mode = False
+    rest: list[str] = []
+    for a in args:
+        if a in ("--plan", "-p"):
+            plan_mode = True
+        else:
+            rest.append(a)
+    target, cfg_path, cfg = _resolve_target_and_cfg(rest)
+    if target is None:
+        return 2
+
+    cache_suffix = LAST_PLAN_BUNDLE_SUFFIX if plan_mode else LAST_BUNDLE_SUFFIX
+    label = "plan" if plan_mode else "update"
+    cache_path = target / cache_suffix
+    if not cache_path.exists():
+        print(f"no cached bundle yet — run `notebook {label}` first to establish a baseline.", file=sys.stderr)
+        return 1
+
+    builder = build_plan_bundle if plan_mode else build_bundle
+    title_key = f"{label}_title"
+    default_title = f"{target.name} — {'Plan & Docs' if plan_mode else 'Project Bundle'}"
+    bundle_title = cfg.get(title_key, default_title)
+
+    print(f"🔎 Computing diff for `{label}` bundle…")
+    new_bundle = builder(target, bundle_title)
+    old_bundle = cache_path.read_text()
+
+    # Strip the always-changing compile timestamp before diffing
+    strip_ts = lambda s: re.sub(r"_Compiled [^_]+_", "_Compiled <ts>_", s)
+    diff = difflib.unified_diff(
+        strip_ts(old_bundle).splitlines(keepends=True),
+        strip_ts(new_bundle).splitlines(keepends=True),
+        fromfile=f"notebook (last upload {cfg.get(f'last_{label}_at', '?')})",
+        tofile="local (now)",
+        n=3,
+    )
+    out = "".join(diff)
+    if not out.strip():
+        print("✓ No changes since last upload.")
+        return 0
+    sys.stdout.write(out)
+    added = sum(1 for ln in out.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in out.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+    print(f"\n— {removed} lines · + {added} lines", file=sys.stderr)
+    return 0
+
+
+def cmd_claude_install(args: list[str]) -> int:
+    cwd = Path.cwd().resolve()
+    cfg_path, cfg = load_project_config(cwd)
+    if not cfg.get("notebook_id"):
+        print("error: no notebook bound. Run `notebook init <URL>` first.", file=sys.stderr)
+        return 2
+    nb = cfg["notebook_id"]
+    nb_url = f"https://notebooklm.google.com/notebook/{nb}"
+
+    block = f"""<!-- notebook:begin -->
+## NotebookLM Context (auto-installed by `notebook claude install`)
+
+This project is bound to NotebookLM notebook **`{nb}`**
+({nb_url}).
+
+**Before answering questions about this project's plan, architecture, prior research, or progress, query the notebook first:**
+
+```bash
+notebooklm ask "<question>" --notebook {nb}
+```
+
+The notebook is the source of truth for: the original plan, deep-research docs,
+the current parity roadmap, and a periodically-refreshed progress snapshot.
+The local repo is the source of truth for the running code.
+
+When the user changes the plan, runs new research, or completes a phase, refresh
+the notebook bundle:
+
+```bash
+notebook update .
+```
+<!-- notebook:end -->
+"""
+
+    target = cwd / "CLAUDE.md"
+    if target.exists():
+        existing = target.read_text()
+        if "<!-- notebook:begin -->" in existing:
+            new = re.sub(
+                r"<!-- notebook:begin -->.*?<!-- notebook:end -->\n?",
+                block,
+                existing,
+                count=1,
+                flags=re.DOTALL,
+            )
+        else:
+            new = existing.rstrip() + "\n\n" + block
+        target.write_text(new)
+        print(f"✓ Updated {target}")
+    else:
+        target.write_text(f"# {cwd.name}\n\n{block}")
+        print(f"✓ Created {target}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Bundle builder
+# --------------------------------------------------------------------------
+
+def find_plan(target: Path) -> Path | None:
+    """Look for a Claude Code plan file referenced from anywhere — first try the
+    project, then ~/.claude/plans/ for the most-recent plan."""
+    for p in target.rglob("*.md"):
+        if "plans" in p.parts and p.is_file():
+            return p
+    plans_dir = Path.home() / ".claude" / "plans"
+    if plans_dir.is_dir():
+        plans = sorted(plans_dir.glob("*.md"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if plans:
+            return plans[0]
+    return None
+
+
+def expand_globs(target: Path) -> list[Path]:
+    """Resolve INCLUDE_GLOBS against `target`, returning unique files in priority order."""
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for pattern in INCLUDE_GLOBS:
+        # Expand brace alternatives (e.g. {js,ts,mjs}) — Python glob doesn't.
+        for expanded in brace_expand(pattern):
+            for p in sorted(target.glob(expanded)):
+                if not p.is_file():
+                    continue
+                if any(part in {"node_modules", ".next", ".venv", "dist", "build", ".git"} for part in p.parts):
+                    continue
+                rp = p.resolve()
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                out.append(p)
+    return out
+
+
+def brace_expand(pattern: str) -> list[str]:
+    m = re.search(r"\{([^{}]+)\}", pattern)
+    if not m:
+        return [pattern]
+    head, mid, tail = pattern[:m.start()], m.group(1), pattern[m.end():]
+    expanded = []
+    for opt in mid.split(","):
+        expanded.extend(brace_expand(head + opt + tail))
+    return expanded
+
+
+PLAN_GLOBS = [
+    "README.md", "README.MD", "Readme.md",
+    "AGENTS.md", "CLAUDE.md",
+    "docs/**/*.md",
+    "DEPLOY.md", "ARCHITECTURE.md", "PARITY*.md", "PORTING*.md",
+    "CHANGELOG.md",
+]
+
+
+def build_plan_bundle(target: Path, title: str) -> str:
+    """Plan + top-level docs only — no source code."""
+    parts: list[str] = [
+        f"# {title}\n",
+        f"_Compiled {datetime.now().isoformat(timespec='seconds')} from `{target}`._\n",
+        "Plan + project docs only. The full repo bundle is uploaded as a separate source.\n",
+        "\n---\n",
+    ]
+    plan = find_plan(target)
+    if plan:
+        parts.append(f"\n## Plan: `{plan.name}`\n\n")
+        parts.append(f"_Source: `{plan}`_\n\n")
+        parts.append(read_capped(plan))
+        parts.append("\n---\n")
+
+    seen: set[Path] = set()
+    docs: list[Path] = []
+    for pattern in PLAN_GLOBS:
+        for expanded in brace_expand(pattern):
+            for p in sorted(target.glob(expanded)):
+                if not p.is_file() or any(part in {"node_modules", ".next", ".venv", "dist", "build", ".git"} for part in p.parts):
+                    continue
+                rp = p.resolve()
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                docs.append(p)
+
+    if docs:
+        parts.append("\n## Docs\n")
+        for p in docs:
+            rel = p.relative_to(target)
+            parts.append(f"\n### `{rel}`\n\n")
+            parts.append(read_capped(p))
+            parts.append("\n")
+    return "".join(parts)
+
+
+def build_bundle(target: Path, title: str) -> str:
+    parts: list[str] = []
+    total = 0
+
+    parts.append(f"# {title}\n")
+    parts.append(f"_Compiled {datetime.now().isoformat(timespec='seconds')} from `{target}`._\n")
+    parts.append("This bundle is regenerated by `notebook update .`. Treat it as the canonical project context.\n")
+    parts.append("\n---\n")
+
+    # 1. Plan
+    plan = find_plan(target)
+    if plan:
+        parts.append(f"\n## Plan: `{plan.name}`\n\n")
+        parts.append(f"_Source: `{plan}`_\n\n")
+        parts.append(read_capped(plan))
+        parts.append("\n---\n")
+
+    # 2. Repo files in priority order
+    files = expand_globs(target)
+    if files:
+        parts.append("\n## Repository files\n")
+        for p in files:
+            chunk = read_capped(p)
+            if total + len(chunk.encode()) > MAX_TOTAL_BYTES:
+                parts.append(f"\n_(stopping bundle — {len(files)} files matched, hit {MAX_TOTAL_BYTES // 1000}KB cap)_\n")
+                break
+            rel = p.relative_to(target)
+            ext = p.suffix.lstrip(".") or "txt"
+            parts.append(f"\n### `{rel}`\n\n")
+            if ext in {"md"}:
+                parts.append(chunk)
+            else:
+                parts.append(f"```{ext}\n{chunk}\n```\n")
+            total += len(chunk.encode())
+
+    return "".join(parts)
+
+
+def read_capped(p: Path) -> str:
+    try:
+        data = p.read_bytes()
+    except Exception as e:
+        return f"_(could not read {p}: {e})_"
+    if len(data) > MAX_BYTES_PER_FILE:
+        head = data[:MAX_BYTES_PER_FILE]
+        return head.decode(errors="replace") + f"\n\n_(truncated — {len(data) - MAX_BYTES_PER_FILE} more bytes)_"
+    return data.decode(errors="replace")
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 1 or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd == "init":
+        return cmd_init(rest)
+    if cmd == "update":
+        return cmd_update(rest)
+    if cmd in ("plan-only", "plan"):
+        return cmd_plan_only(rest)
+    if cmd == "diff":
+        return cmd_diff(rest)
+    if cmd == "claude" and rest and rest[0] == "install":
+        return cmd_claude_install(rest[1:])
+    if cmd == "ask":
+        cfg_path, cfg = load_project_config(Path.cwd())
+        if cfg.get("notebook_id") and "--notebook" not in rest and "-n" not in rest:
+            rest = rest + ["--notebook", cfg["notebook_id"]]
+        return subprocess.run(["notebooklm", "ask", *rest]).returncode
+
+    # Pass-through anything else
+    return subprocess.run(["notebooklm", cmd, *rest]).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
