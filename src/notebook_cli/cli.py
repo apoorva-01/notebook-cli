@@ -11,8 +11,15 @@
     notebook plan create [PATH]
                               Use the `claude` CLI to draft (or refresh) a
                               PLAN.md in the project root, summarising goal,
-                              architecture, status, and key files. `update`
-                              will prompt to run this if no plan is found.
+                              architecture, status, and key files.
+
+    notebook plan import [PATH]
+                              List Claude Code session plans from
+                              ~/.claude/plans/ and copy the one you pick
+                              into the project root as PLAN.md.
+
+                              `update` offers both options when no plan
+                              exists in the project.
 
     notebook plan-only [PATH] Like `update` but only the plan + top-level docs
                               (README, AGENTS.md, CLAUDE.md, docs/**) — no code.
@@ -313,6 +320,58 @@ Constraints:
 """
 
 
+def list_session_plans() -> list[Path]:
+    """Return all *.md files under ~/.claude/plans/, newest first."""
+    plans_dir = Path.home() / ".claude" / "plans"
+    if not plans_dir.is_dir():
+        return []
+    return sorted(plans_dir.glob("*.md"), key=lambda x: x.stat().st_mtime, reverse=True)
+
+
+def _first_heading(p: Path) -> str:
+    try:
+        for line in p.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("#"):
+                return line.lstrip("#").strip()[:80]
+        return ""
+    except Exception:
+        return ""
+
+
+def pick_and_import_session_plan(target: Path) -> Path | None:
+    """Interactively pick a plan from ~/.claude/plans/ and copy it into the
+    project root as PLAN.md. Returns the new local path, or None if cancelled."""
+    plans = list_session_plans()
+    if not plans:
+        print("No plans found in ~/.claude/plans/.", file=sys.stderr)
+        return None
+    print("Claude Code session plans (newest first):")
+    for i, p in enumerate(plans, 1):
+        ts = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        title = _first_heading(p) or "(no heading)"
+        print(f"  {i:>2}. [{ts}] {p.name}\n       {title}")
+    sel = input(f"Pick [1-{len(plans)}, or blank to cancel]: ").strip()
+    if not sel:
+        return None
+    try:
+        idx = int(sel)
+        if not (1 <= idx <= len(plans)):
+            raise ValueError
+    except ValueError:
+        print("error: invalid selection.", file=sys.stderr)
+        return None
+    src = plans[idx - 1]
+    dest = target / "PLAN.md"
+    if dest.exists():
+        ans = input(f"{dest} already exists. Overwrite? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            return None
+    dest.write_text(src.read_text(errors="replace"))
+    print(f"✓ Copied {src.name} → {dest}")
+    return dest
+
+
 def cmd_plan_create(args: list[str]) -> int:
     """Generate or refresh a PLAN.md by invoking the Claude Code CLI."""
     target = Path(args[0]).resolve() if args else Path.cwd().resolve()
@@ -348,6 +407,18 @@ def cmd_plan_create(args: list[str]) -> int:
     plan_path.write_text(body + "\n")
     print(f"✓ Wrote {plan_path} ({len(body)} chars)")
     return 0
+
+
+def cmd_plan_import(args: list[str]) -> int:
+    """Pick a plan from ~/.claude/plans/ and copy it into the project root."""
+    target = Path(args[0]).resolve() if args else Path.cwd().resolve()
+    if not target.is_dir():
+        print(f"error: {target} is not a directory", file=sys.stderr)
+        return 2
+    if not sys.stdin.isatty():
+        print("error: `plan import` requires an interactive terminal.", file=sys.stderr)
+        return 1
+    return 0 if pick_and_import_session_plan(target) else 1
 
 
 def cmd_plan_only(args: list[str]) -> int:
@@ -602,19 +673,26 @@ def build_bundle(target: Path, title: str) -> str:
         parts.append("\n---\n")
     else:
         if sys.stdin.isatty():
-            ans = input("ℹ️  No plan file found in this project. Generate one with Claude Code now? [Y/n] ").strip().lower()
-            if ans in ("", "y", "yes"):
+            print("ℹ️  No plan file found in this project. What do you want to do?")
+            print("  1) Generate a new plan with Claude Code (writes PLAN.md)")
+            print("  2) Pick an existing Claude Code session plan from ~/.claude/plans/")
+            print("  3) Skip — bundle without a plan")
+            choice = input("Choice [1/2/3]: ").strip()
+            new_plan: Path | None = None
+            if choice == "1":
                 rc = cmd_plan_create([str(target)])
                 if rc == 0:
-                    plan = find_plan(target)
-                    if plan:
-                        parts.append(f"\n## Plan: `{plan.name}`\n\n")
-                        parts.append(f"_Source: `{plan}`_\n\n")
-                        parts.append(read_capped(plan))
-                        parts.append("\n---\n")
+                    new_plan = find_plan(target)
+            elif choice == "2":
+                new_plan = pick_and_import_session_plan(target)
+            if new_plan:
+                parts.append(f"\n## Plan: `{new_plan.name}`\n\n")
+                parts.append(f"_Source: `{new_plan}`_\n\n")
+                parts.append(read_capped(new_plan))
+                parts.append("\n---\n")
         else:
-            print("ℹ️  No plan file found. Run `notebook plan create` to generate one,", file=sys.stderr)
-            print("   add a PLAN.md at the project root, or set \"plan\" in .notebook.json.", file=sys.stderr)
+            print("ℹ️  No plan file found. Run `notebook plan create` (generate via Claude Code)", file=sys.stderr)
+            print("   or `notebook plan import` (pick from ~/.claude/plans/), or add PLAN.md.", file=sys.stderr)
 
     # 2. Repo files in priority order
     files = expand_globs(target)
@@ -665,6 +743,8 @@ def main(argv: list[str]) -> int:
         return cmd_update(rest)
     if cmd == "plan" and rest and rest[0] == "create":
         return cmd_plan_create(rest[1:])
+    if cmd == "plan" and rest and rest[0] == "import":
+        return cmd_plan_import(rest[1:])
     if cmd == "plan-only":
         return cmd_plan_only(rest)
     if cmd == "diff":

@@ -111,14 +111,33 @@ notebook update /path/to/another/project
 
 Generate (or refresh) a `PLAN.md` at the project root by invoking the [Claude Code](https://claude.com/claude-code) CLI non-interactively. Claude reads the codebase and emits a structured plan (Goal · Architecture · Status · Key files · Decisions · Open questions).
 
-`notebook update` will offer to run this for you the first time it finds no plan in the project. The prompt only fires if you're in a real terminal.
-
-Requires the `claude` CLI on your `PATH` (Claude Code).
+Requires the `claude` CLI on your `PATH`.
 
 ```bash
-notebook plan create        # writes PLAN.md in cwd
-notebook plan create /path/to/repo
+notebook plan create
 ```
+
+### `notebook plan import [PATH]`
+
+Lists Claude Code session plans from `~/.claude/plans/` (newest first, with timestamp + first heading), prompts you to pick one, and copies the chosen file into the project root as `PLAN.md`. Useful when the plan was already drafted in another Claude Code session.
+
+```bash
+notebook plan import
+```
+
+### Missing-plan flow during `update`
+
+When you run `notebook update` and no plan is found in the project, you get a 3-option prompt:
+
+```
+ℹ️  No plan file found in this project. What do you want to do?
+  1) Generate a new plan with Claude Code (writes PLAN.md)
+  2) Pick an existing Claude Code session plan from ~/.claude/plans/
+  3) Skip — bundle without a plan
+Choice [1/2/3]:
+```
+
+In non-interactive contexts (CI, piped stdin) the prompt is suppressed and `update` continues without a plan, with a hint pointing at `notebook plan create` or `notebook plan import`.
 
 ### `notebook plan-only [PATH]`
 
