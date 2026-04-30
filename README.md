@@ -107,6 +107,19 @@ notebook update .
 notebook update /path/to/another/project
 ```
 
+### `notebook plan create [PATH]`
+
+Generate (or refresh) a `PLAN.md` at the project root by invoking the [Claude Code](https://claude.com/claude-code) CLI non-interactively. Claude reads the codebase and emits a structured plan (Goal · Architecture · Status · Key files · Decisions · Open questions).
+
+`notebook update` will offer to run this for you the first time it finds no plan in the project. The prompt only fires if you're in a real terminal.
+
+Requires the `claude` CLI on your `PATH` (Claude Code).
+
+```bash
+notebook plan create        # writes PLAN.md in cwd
+notebook plan create /path/to/repo
+```
+
 ### `notebook plan-only [PATH]`
 
 Like `update` but bundles **plan + docs only** — no code. Uploaded as a separate source titled `<repo> — Plan & Docs` so it lives alongside the full bundle. Useful when code volume drowns out strategic docs in retrieval.

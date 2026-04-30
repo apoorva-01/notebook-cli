@@ -8,6 +8,12 @@
                               configured in this project's .notebook.json.
                               Replaces the prior bundle source if one exists.
 
+    notebook plan create [PATH]
+                              Use the `claude` CLI to draft (or refresh) a
+                              PLAN.md in the project root, summarising goal,
+                              architecture, status, and key files. `update`
+                              will prompt to run this if no plan is found.
+
     notebook plan-only [PATH] Like `update` but only the plan + top-level docs
                               (README, AGENTS.md, CLAUDE.md, docs/**) — no code.
                               Uploaded as a separate "Plan only" source.
@@ -286,6 +292,64 @@ def cmd_update(args: list[str]) -> int:
     )
 
 
+PLAN_PROMPT = """\
+Read this codebase end-to-end and write a single Markdown file titled PLAN.md
+that captures the project's plan-of-record. Structure:
+
+  1. # <Project Name>
+  2. ## Goal — one paragraph: what this codebase is trying to accomplish.
+  3. ## Architecture — short description + ascii / mermaid sketch if useful.
+  4. ## Status — what's done (bullet list) and what's pending (bullet list).
+  5. ## Key files & directories — annotated, only the load-bearing ones.
+  6. ## Decisions & trade-offs — the non-obvious ones, briefly.
+  7. ## Open questions / risks — anything you noticed worth flagging.
+
+Constraints:
+- Output PLAN.md content ONLY — no preamble, no explanations.
+- Be concrete (function/file names) not generic.
+- Cap output at ~500 lines.
+- If the repo already has a partial PLAN.md / ROADMAP.md / docs/PLAN.md,
+  treat that as a starting point and update/extend rather than replacing it.
+"""
+
+
+def cmd_plan_create(args: list[str]) -> int:
+    """Generate or refresh a PLAN.md by invoking the Claude Code CLI."""
+    target = Path(args[0]).resolve() if args else Path.cwd().resolve()
+    if not target.is_dir():
+        print(f"error: {target} is not a directory", file=sys.stderr)
+        return 2
+
+    # Locate `claude` CLI
+    if subprocess.run(["which", "claude"], capture_output=True).returncode != 0:
+        print("error: the `claude` CLI is not on your PATH.", file=sys.stderr)
+        print("       install Claude Code: https://claude.com/claude-code", file=sys.stderr)
+        return 1
+
+    plan_path = target / "PLAN.md"
+    print(f"🧠 Asking Claude Code to draft {plan_path}…")
+    print("   (this runs `claude --print` non-interactively against the project)")
+    r = subprocess.run(
+        ["claude", "--print", PLAN_PROMPT],
+        cwd=str(target),
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        print(f"error: claude exited {r.returncode}", file=sys.stderr)
+        return r.returncode
+    body = r.stdout.strip()
+    if not body:
+        print("error: claude returned empty output.", file=sys.stderr)
+        return 1
+    # Strip ``` fences if Claude wrapped the output
+    body = re.sub(r"^```(?:markdown|md)?\n?", "", body)
+    body = re.sub(r"\n?```\s*$", "", body)
+    plan_path.write_text(body + "\n")
+    print(f"✓ Wrote {plan_path} ({len(body)} chars)")
+    return 0
+
+
 def cmd_plan_only(args: list[str]) -> int:
     target, cfg_path, cfg = _resolve_target_and_cfg(args)
     if target is None:
@@ -409,16 +473,36 @@ notebook update .
 # --------------------------------------------------------------------------
 
 def find_plan(target: Path) -> Path | None:
-    """Look for a Claude Code plan file referenced from anywhere — first try the
-    project, then ~/.claude/plans/ for the most-recent plan."""
+    """Find a project-local plan file.
+
+    Resolution order (project-scoped only — never reads from another project):
+      1. `plan` field in .notebook.json (path, absolute or relative to project).
+      2. First *.md under <project>/**/plans/.
+      3. Common project-root names: PLAN.md, plan.md, ROADMAP.md.
+
+    We deliberately do NOT fall back to ~/.claude/plans/ — that directory is
+    shared across all sessions, and the most-recent file there usually
+    belongs to a different project.
+    """
+    cfg_path, cfg = load_project_config(target)
+    if isinstance(cfg.get("plan"), str):
+        p = Path(cfg["plan"])
+        if not p.is_absolute():
+            p = target / p
+        if p.is_file():
+            return p
+
     for p in target.rglob("*.md"):
+        if any(part in {"node_modules", ".next", ".venv", "dist", "build", ".git"} for part in p.parts):
+            continue
         if "plans" in p.parts and p.is_file():
             return p
-    plans_dir = Path.home() / ".claude" / "plans"
-    if plans_dir.is_dir():
-        plans = sorted(plans_dir.glob("*.md"), key=lambda x: x.stat().st_mtime, reverse=True)
-        if plans:
-            return plans[0]
+
+    for name in ("PLAN.md", "plan.md", "ROADMAP.md", "Roadmap.md"):
+        cand = target / name
+        if cand.is_file():
+            return cand
+
     return None
 
 
@@ -509,13 +593,28 @@ def build_bundle(target: Path, title: str) -> str:
     parts.append("This bundle is regenerated by `notebook update .`. Treat it as the canonical project context.\n")
     parts.append("\n---\n")
 
-    # 1. Plan
+    # 1. Plan (project-scoped only — see find_plan)
     plan = find_plan(target)
     if plan:
         parts.append(f"\n## Plan: `{plan.name}`\n\n")
         parts.append(f"_Source: `{plan}`_\n\n")
         parts.append(read_capped(plan))
         parts.append("\n---\n")
+    else:
+        if sys.stdin.isatty():
+            ans = input("ℹ️  No plan file found in this project. Generate one with Claude Code now? [Y/n] ").strip().lower()
+            if ans in ("", "y", "yes"):
+                rc = cmd_plan_create([str(target)])
+                if rc == 0:
+                    plan = find_plan(target)
+                    if plan:
+                        parts.append(f"\n## Plan: `{plan.name}`\n\n")
+                        parts.append(f"_Source: `{plan}`_\n\n")
+                        parts.append(read_capped(plan))
+                        parts.append("\n---\n")
+        else:
+            print("ℹ️  No plan file found. Run `notebook plan create` to generate one,", file=sys.stderr)
+            print("   add a PLAN.md at the project root, or set \"plan\" in .notebook.json.", file=sys.stderr)
 
     # 2. Repo files in priority order
     files = expand_globs(target)
@@ -564,7 +663,9 @@ def main(argv: list[str]) -> int:
         return cmd_init(rest)
     if cmd == "update":
         return cmd_update(rest)
-    if cmd in ("plan-only", "plan"):
+    if cmd == "plan" and rest and rest[0] == "create":
+        return cmd_plan_create(rest[1:])
+    if cmd == "plan-only":
         return cmd_plan_only(rest)
     if cmd == "diff":
         return cmd_diff(rest)
