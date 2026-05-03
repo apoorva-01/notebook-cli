@@ -300,23 +300,34 @@ def cmd_update(args: list[str]) -> int:
 
 
 PLAN_PROMPT = """\
-Read this codebase end-to-end and write a single Markdown file titled PLAN.md
-that captures the project's plan-of-record. Structure:
+Read this codebase end-to-end and write a single comprehensive Markdown file
+titled PLAN.md that documents the project as a knowledge base. Use these
+top-level sections (skip any that genuinely don't apply):
 
   1. # <Project Name>
-  2. ## Goal — one paragraph: what this codebase is trying to accomplish.
-  3. ## Architecture — short description + ascii / mermaid sketch if useful.
-  4. ## Status — what's done (bullet list) and what's pending (bullet list).
-  5. ## Key files & directories — annotated, only the load-bearing ones.
-  6. ## Decisions & trade-offs — the non-obvious ones, briefly.
-  7. ## Open questions / risks — anything you noticed worth flagging.
+  2. ## Overview & Goals — what this codebase is trying to accomplish, and why.
+  3. ## Plan — milestones, phases, what's planned next. If no explicit plan
+     exists yet, infer it from open TODOs, scaffolding, and partial features.
+  4. ## Features — every feature/capability the codebase implements or
+     stubs out, grouped logically. Be specific (file names, command names,
+     user-visible behaviors). This is the section that should be longest.
+  5. ## Architecture — components, data flow, module boundaries, key design
+     choices. Include an ascii or mermaid sketch if it clarifies things.
+  6. ## Deployment — how this is/will be deployed: infra, environment
+     variables, secrets, build commands, rollout steps. If nothing is wired
+     yet, say so and list what's missing.
+  7. ## Decisions & trade-offs — non-obvious choices and why they were made.
+  8. ## Key files & directories — annotated, only the load-bearing ones.
+  9. ## Status — what's done (bullets), what's pending (bullets),
+     known issues, open questions/risks.
 
 Constraints:
-- Output PLAN.md content ONLY — no preamble, no explanations.
-- Be concrete (function/file names) not generic.
-- Cap output at ~500 lines.
+- Output PLAN.md content ONLY — no preamble, no explanations, no fences.
+- Be concrete (function/file names, command names, real paths) not generic.
+- Prefer faithfully reflecting what's actually in the repo over inventing.
 - If the repo already has a partial PLAN.md / ROADMAP.md / docs/PLAN.md,
   treat that as a starting point and update/extend rather than replacing it.
+- No hard line cap — produce the detail the codebase warrants.
 """
 
 
