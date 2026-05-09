@@ -570,25 +570,18 @@ def cmd_diff(args: list[str]) -> int:
     return 0
 
 
-def cmd_claude_install(args: list[str]) -> int:
-    cwd = Path.cwd().resolve()
-    cfg_path, cfg = load_project_config(cwd)
-    if not cfg.get("notebook_id"):
-        print("error: no notebook bound. Run `notebook init <URL>` first.", file=sys.stderr)
-        return 2
-    nb = cfg["notebook_id"]
-    nb_url = f"https://notebooklm.google.com/notebook/{nb}"
+def make_notebook_block(notebook_id: str, agent_type: str, install_cmd: str) -> str:
+    nb_url = f"https://notebooklm.google.com/notebook/{notebook_id}"
+    return f"""<!-- notebook:begin -->
+## NotebookLM Context (auto-installed by `{install_cmd}`)
 
-    block = f"""<!-- notebook:begin -->
-## NotebookLM Context (auto-installed by `notebook claude install`)
-
-This project is bound to NotebookLM notebook **`{nb}`**
+This project is bound to NotebookLM notebook **`{notebook_id}`**
 ({nb_url}).
 
 **Before answering questions about this project's plan, architecture, prior research, or progress, query the notebook first:**
 
 ```bash
-notebooklm ask "<question>" --notebook {nb}
+notebooklm ask "<question>" --notebook {notebook_id}
 ```
 
 The notebook is the source of truth for: the original plan, deep-research docs,
@@ -604,7 +597,8 @@ notebook update .
 <!-- notebook:end -->
 """
 
-    target = cwd / "CLAUDE.md"
+
+def write_notebook_block(target: Path, block: str) -> int:
     if target.exists():
         existing = target.read_text()
         if "<!-- notebook:begin -->" in existing:
@@ -620,9 +614,25 @@ notebook update .
         target.write_text(new)
         print(f"✓ Updated {target}")
     else:
-        target.write_text(f"# {cwd.name}\n\n{block}")
+        target.write_text(f"# {target.parent.name}\n\n{block}")
         print(f"✓ Created {target}")
     return 0
+
+
+def cmd_agent_install(args: list[str], agent_type: str, target_file: str, install_cmd: str) -> int:
+    cwd = Path.cwd().resolve()
+    cfg_path, cfg = load_project_config(cwd)
+    if not cfg.get("notebook_id"):
+        print("error: no notebook bound. Run `notebook init <URL>` first.", file=sys.stderr)
+        return 2
+    nb = cfg["notebook_id"]
+    block = make_notebook_block(nb, agent_type, install_cmd)
+    target = cwd / target_file
+    return write_notebook_block(target, block)
+
+
+def cmd_claude_install(args: list[str]) -> int:
+    return cmd_agent_install(args, "claude", "CLAUDE.md", "notebook claude install")
 
 
 # --------------------------------------------------------------------------
@@ -837,6 +847,10 @@ def main(argv: list[str]) -> int:
         return cmd_diff(rest)
     if cmd == "claude" and rest and rest[0] == "install":
         return cmd_claude_install(rest[1:])
+    if cmd == "opencode" and rest and rest[0] == "install":
+        return cmd_agent_install(rest[1:], "opencode", "AGENTS.md", "notebook opencode install")
+    if cmd == "codex" and rest and rest[0] == "install":
+        return cmd_agent_install(rest[1:], "codex", ".cursorrules", "notebook codex install")
     if cmd == "ask":
         cfg_path, cfg = load_project_config(Path.cwd())
         if cfg.get("notebook_id") and "--notebook" not in rest and "-n" not in rest:

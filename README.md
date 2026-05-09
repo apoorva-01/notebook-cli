@@ -10,6 +10,8 @@ notebook update .          # bundle plan + docs + key code → upload as one sou
 notebook diff              # preview what'll change before uploading
 notebook plan-only .       # plan + docs only, as a separate source
 notebook claude install    # add NotebookLM context block to CLAUDE.md
+notebook opencode install  # add to AGENTS.md
+notebook codex install     # add to .cursorrules
 notebook ask "..."         # query the bound notebook
 ```
 
@@ -172,6 +174,26 @@ The block tells Claude Code:
 
 ```bash
 notebook claude install
+```
+
+### `notebook opencode install`
+
+Inject a NotebookLM context block into the project's `AGENTS.md`. Creates the file if missing; replaces an existing `<!-- notebook:begin -->…<!-- notebook:end -->` block in place.
+
+The block tells OpenCode to query NotebookLM first for plan/architecture/research questions.
+
+```bash
+notebook opencode install
+```
+
+### `notebook codex install`
+
+Inject a NotebookLM context block into the project's `.cursorrules`. Creates the file if missing; replaces an existing `<!-- notebook:begin -->…<!-- notebook:end -->` block in place.
+
+The block tells Codex to query NotebookLM first for plan/architecture/research questions.
+
+```bash
+notebook codex install
 ```
 
 ### `notebook ask "QUESTION"`
